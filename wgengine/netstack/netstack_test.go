@@ -19,6 +19,7 @@ import (
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
@@ -2062,7 +2063,7 @@ func udp4raw(t testing.TB, src, dst netip.Addr, sport, dport uint16, payload []b
 		tcpip.AddrFrom4Slice(dst.AsSlice()),
 		uint16(header.UDPMinimumSize+len(payload)),
 	)
-	u.SetChecksum(^header.UDP(buf[header.IPv4MinimumSize:]).CalculateChecksum(xsum))
+	u.SetChecksum(^u.CalculateChecksum(checksum.Checksum(payload, xsum)))
 	return buf
 }
 

@@ -21,13 +21,11 @@ import (
 
 // RXChecksumOffload validates IPv4, TCP, and UDP header checksums in p,
 // returning an equivalent *stack.PacketBuffer if they are valid, otherwise nil.
-// The set of headers validated covers where gVisor would perform validation if
-// !stack.PacketBuffer.RXChecksumValidated, i.e. it satisfies
-// stack.CapabilityRXChecksumOffload. Other protocols with checksum fields,
-// e.g. ICMP{v6}, are still validated by gVisor regardless of rx checksum
-// offloading capabilities. IPv4 fragments cannot have their L4 checksums
-// validated before reassembly, so only their IPv4 header checksum is validated
-// here.
+// The returned buffer carries per-packet TCP/UDP checksum status for
+// stack.CapabilityRXChecksumOffloadPerPacket. Other protocols with checksum
+// fields, e.g. ICMP{v6}, are still validated by gVisor. Fragments cannot have
+// their L4 checksums validated before reassembly. IPv4 fragments still have
+// their header checksum validated.
 func RXChecksumOffload(p *packet.Parsed) *stack.PacketBuffer {
 	var (
 		pn        tcpip.NetworkProtocolNumber
@@ -48,23 +46,25 @@ func RXChecksumOffload(p *packet.Parsed) *stack.PacketBuffer {
 		if ^tun.Checksum(buf[:csumStart], 0) != 0 {
 			return nil
 		}
-		// Non-first fragments (FragmentOffset != 0) arrive here with
-		// p.IPProto == ipproto.Fragment (set by packet.Parsed.Decode), so
-		// they already skip the L4 checksum check below. We only need to
-		// catch the first fragment, which still has its real IPProto.
-		fragment = header.IPv4(buf).More()
+		fragment = header.IPv4(buf).More() || header.IPv4(buf).FragmentOffset() != 0
 		pn = header.IPv4ProtocolNumber
 	case 6:
 		if len(buf) < header.IPv6FixedHeaderSize {
 			return nil
 		}
+		packetLen := header.IPv6FixedHeaderSize + int(header.IPv6(buf).PayloadLength())
+		if packetLen > len(buf) {
+			return nil
+		}
+		buf = buf[:packetLen]
 		csumStart = header.IPv6FixedHeaderSize
 		pn = header.IPv6ProtocolNumber
-		if p.IPProto != ipproto.ICMPv6 && p.IPProto != ipproto.TCP && p.IPProto != ipproto.UDP {
+		hasExtensionHeader := ipproto.Proto(buf[6]) != p.IPProto
+		if hasExtensionHeader || (p.IPProto != ipproto.ICMPv6 && p.IPProto != ipproto.TCP && p.IPProto != ipproto.UDP) {
 			// buf could have extension headers before a UDP or TCP header, but
-			// packet.Parsed.IPProto will be set to the ext header type, so we
-			// have to look deeper. We are still responsible for validating the
-			// L4 checksum in this case. So, make use of gVisor's existing
+			// packet.Parsed may already have advanced through a Fragment header.
+			// Find the transport offset and distinguish fragments from atomic
+			// fragments before validating L4. Make use of gVisor's existing
 			// extension header parsing via parse.IPv6() in order to unpack the
 			// L4 csumStart index. This is not particularly efficient as we have
 			// to allocate a short-lived stack.PacketBuffer that cannot be
@@ -76,7 +76,8 @@ func RXChecksumOffload(p *packet.Parsed) *stack.PacketBuffer {
 			defer packetBuf.DecRef()
 			// The rightmost bool returns false only if packetBuf is too short,
 			// which we've already accounted for above.
-			transportProto, _, _, _, _ := parse.IPv6(packetBuf)
+			transportProto, _, fragOffset, fragMore, _ := parse.IPv6(packetBuf)
+			fragment = fragOffset != 0 || fragMore
 			if transportProto == header.TCPProtocolNumber || transportProto == header.UDPProtocolNumber {
 				csumLen := packetBuf.Data().Size()
 				if len(buf) < csumLen {
@@ -105,11 +106,7 @@ func RXChecksumOffload(p *packet.Parsed) *stack.PacketBuffer {
 		Payload: buffer.MakeWithData(bytes.Clone(buf)),
 	})
 	packetBuf.NetworkProtocolNumber = pn
-	// Setting this is not technically required. gVisor overrides where
-	// stack.CapabilityRXChecksumOffload is advertised from Capabilities().
-	// https://github.com/google/gvisor/blob/64c016c92987cc04dfd4c7b091ddd21bdad875f8/pkg/tcpip/stack/nic.go#L763
-	// This is also why we offload for all packets since we cannot signal this
-	// per-packet.
-	packetBuf.RXChecksumValidated = true
+	// A non-atomic fragment cannot validate the full transport checksum.
+	packetBuf.RXChecksumValidated = !fragment
 	return packetBuf
 }

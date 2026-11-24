@@ -5,12 +5,15 @@ package gro
 
 import (
 	"bytes"
+	"encoding/binary"
 	"net/netip"
 	"testing"
 
+	"github.com/tailscale/wireguard-go/tun"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"tailscale.com/net/packet"
+	"tailscale.com/types/ipproto"
 )
 
 func Test_RXChecksumOffload(t *testing.T) {
@@ -84,41 +87,103 @@ func Test_RXChecksumOffload(t *testing.T) {
 	at = 40 + 8 + 16
 	tcp6ExtHeaderInvalidCsum[at] = ^tcp6ExtHeaderInvalidCsum[at]
 
-	tests := []struct {
-		name   string
-		input  []byte
-		wantPB bool
-	}{
+	type testCase struct {
+		name          string
+		input         []byte
+		wantPB        bool
+		wantValidated bool
+	}
+	tests := []testCase{
 		{
 			"tcp4 packet valid csum",
 			tcp4,
+			true,
 			true,
 		},
 		{
 			"tcp6 with ext header valid csum",
 			tcp6ExtHeader,
 			true,
+			true,
 		},
 		{
 			"tcp4 packet invalid csum",
 			tcp4InvalidCsum,
+			false,
 			false,
 		},
 		{
 			"tcp4 first fragment skips L4 csum",
 			tcp4FirstFragment,
 			true,
+			false,
 		},
 		{
 			"tcp4 second fragment skips L4 csum",
 			tcp4SecondFragment,
 			true,
+			false,
 		},
 		{
 			"tcp6 with ext header invalid csum",
 			tcp6ExtHeaderInvalidCsum,
 			false,
+			false,
 		},
+	}
+	udp6ExtHeader := bytes.Clone(tcp6ExtHeader)
+	udp6ExtHeader[40] = uint8(ipproto.UDP)
+	udpH := header.UDP(udp6ExtHeader[48:])
+	udpH.Encode(&header.UDPFields{SrcPort: 1, DstPort: 1, Length: uint16(len(udpH))})
+	sum := header.PseudoHeaderChecksum(header.UDPProtocolNumber, ipv6H.SourceAddress(), ipv6H.DestinationAddress(), uint16(len(udpH)))
+	udpH.SetChecksum(^tun.Checksum(udpH, sum))
+
+	corrupt := func(buf []byte) []byte {
+		buf = bytes.Clone(buf)
+		buf[len(buf)-1] ^= 1
+		return buf
+	}
+	for _, base := range [][]byte{tcp6ExtHeader, udp6ExtHeader} {
+		proto := ipproto.Proto(base[40])
+		transportLen := len(base) - 48
+		fragment := func(start, end int, more bool) []byte {
+			buf := append(bytes.Clone(base[:48]), base[48+start:48+end]...)
+			buf[6] = uint8(header.IPv6FragmentExtHdrIdentifier)
+			header.IPv6(buf).SetPayloadLength(uint16(len(buf) - 40))
+			offset := uint16(start)
+			if more {
+				offset |= 1
+			}
+			binary.BigEndian.PutUint16(buf[42:44], offset)
+			return buf
+		}
+		padded := func(packet []byte) []byte {
+			buf := append(bytes.Clone(packet), make([]byte, 8)...)
+			sum := header.PseudoHeaderChecksum(tcpip.TransportProtocolNumber(proto), ipv6H.SourceAddress(), ipv6H.DestinationAddress(), uint16(transportLen))
+			// Match an incorrect checksum starting eight bytes late and including padding.
+			binary.BigEndian.PutUint16(buf[len(buf)-2:], ^tun.Checksum(buf[56:], sum))
+			return buf
+		}
+		plain := append(bytes.Clone(base[:40]), base[48:]...)
+		plain[6] = uint8(proto)
+		header.IPv6(plain).SetPayloadLength(uint16(transportLen))
+		atomic := fragment(0, transportLen, false)
+		for _, test := range []testCase{
+			{"plain", plain, true, true},
+			{"plain invalid checksum", corrupt(plain), false, false},
+			{"first fragment", fragment(0, 64, true), true, false},
+			{"middle fragment", fragment(64, 96, true), true, false},
+			{"last fragment", fragment(96, transportLen, false), true, false},
+			{"atomic fragment", atomic, true, true},
+			{"atomic invalid checksum", corrupt(atomic), false, false},
+			{"atomic with padding", padded(atomic), true, true},
+			{"atomic invalid checksum with compensating padding", padded(corrupt(atomic)), false, false},
+			{"options with padding", padded(base), true, true},
+			{"options invalid checksum with compensating padding", padded(corrupt(base)), false, false},
+		} {
+			test.name = proto.String() + "6 " + test.name
+			tests = append(tests, test)
+		}
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -129,8 +194,17 @@ func Test_RXChecksumOffload(t *testing.T) {
 				t.Fatalf("wantPB = %v != (got != nil): %v", tt.wantPB, got != nil)
 			}
 			if tt.wantPB {
+				defer got.DecRef()
+				if got.RXChecksumValidated != tt.wantValidated {
+					t.Errorf("RXChecksumValidated = %v, want %v", got.RXChecksumValidated, tt.wantValidated)
+				}
 				gotBuf := got.ToBuffer()
-				if !bytes.Equal(tt.input, gotBuf.Flatten()) {
+				defer gotBuf.Release()
+				want := tt.input
+				if p.IPVersion == 6 {
+					want = want[:header.IPv6MinimumSize+int(header.IPv6(want).PayloadLength())]
+				}
+				if !bytes.Equal(want, gotBuf.Flatten()) {
 					t.Fatal("output packet unequal to input")
 				}
 			}

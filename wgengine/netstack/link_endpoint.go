@@ -345,9 +345,9 @@ func (ep *linkEndpoint) SetMTU(mtu uint32) {
 
 // Capabilities implements stack.LinkEndpoint.Capabilities.
 func (ep *linkEndpoint) Capabilities() stack.LinkEndpointCapabilities {
-	// We are required to offload RX checksum validation for the purposes of
-	// GRO.
-	return stack.CapabilityRXChecksumOffload
+	// GRO packets have validated checksums; fragments need validation after
+	// reassembly.
+	return stack.CapabilityRXChecksumOffloadPerPacket
 }
 
 // GSOMaxSize implements stack.GSOEndpoint.
